@@ -1,28 +1,50 @@
 import os
 import json
-import asyncio
+import time
 import threading
-from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import Request, urlopen
+from datetime import datetime
+
 from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
 
-# ============================================================
-# 基础设置
-# ============================================================
+# =========================================================
+# 基础配置
+# =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
+
 PORT = int(os.getenv("PORT", "10000"))
 
-# Binance USDT 永续合约
 BINANCE_API = "https://fapi.binance.com/fapi/v1/klines"
 
-# 固定监控币种
+BINANCE_EXCHANGE_INFO = (
+    "https://fapi.binance.com/fapi/v1/exchangeInfo"
+)
+
+SCAN_INTERVAL = 180
+
+CHAT_FILE = "chat_ids.json"
+
+
+# =========================================================
+# 监控币种
+# =========================================================
+
 SYMBOLS = [
+
+    # =========================
+    # 核心45
+    # =========================
+
     "BTCUSDT",
     "ETHUSDT",
     "BNBUSDT",
@@ -33,6 +55,7 @@ SYMBOLS = [
     "ADAUSDT",
     "HYPEUSDT",
     "ZECUSDT",
+
     "BCHUSDT",
     "LINKUSDT",
     "AVAXUSDT",
@@ -43,6 +66,7 @@ SYMBOLS = [
     "SHIBUSDT",
     "LTCUSDT",
     "DOTUSDT",
+
     "UNIUSDT",
     "NEARUSDT",
     "ICPUSDT",
@@ -53,6 +77,7 @@ SYMBOLS = [
     "ARBUSDT",
     "CROUSDT",
     "VETUSDT",
+
     "FILUSDT",
     "ALGOUSDT",
     "RENDERUSDT",
@@ -63,546 +88,1482 @@ SYMBOLS = [
     "GRTUSDT",
     "SEIUSDT",
     "QNTUSDT",
+
     "THETAUSDT",
     "TIAUSDT",
     "MKRUSDT",
     "MNTUSDT",
     "PEPEUSDT",
+
+
+    # =========================
+    # 第一批扩展强势组
+    # =========================
+
+    "WIFUSDT",
+    "BONKUSDT",
+    "FLOKIUSDT",
+    "JUPUSDT",
+    "ENAUSDT",
+    "ONDOUSDT",
+    "RUNEUSDT",
+    "WLDUSDT",
+    "STXUSDT",
+    "CRVUSDT",
+
+
+    # =========================
+    # 第二批近期强势组
+    # =========================
+
+    "MAGMAUSDT",
+    "FFUSDT",
+    "LISKUSDT",
+    "ARKUSDT",
+    "EMBERUSDT",
+    "PENGUUSDT",
+    "JASMYUSDT",
+
 ]
 
-# 记录已经收到 /start 的聊天
-CHAT_FILE = "chat_ids.json"
 
-# 防止同一个信号重复发送
-last_signals = {}
-
-# 每个币最后一次扫描时间
-last_scan_time = {}
+# 自动去重
+SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
 
-# ============================================================
-# Render 健康检查网页
-# ============================================================
+# =========================================================
+# 全局变量
+# =========================================================
 
-class HealthHandler(BaseHTTPRequestHandler):
+CHAT_IDS = set()
+
+LAST_SIGNALS = {}
+
+VALID_SYMBOLS = set()
+
+
+# =========================================================
+# 读取 / 保存群聊ID
+# =========================================================
+
+def load_chat_ids():
+
+    global CHAT_IDS
+
+    try:
+
+        if os.path.exists(CHAT_FILE):
+
+            with open(
+                CHAT_FILE,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                data = json.load(f)
+
+            CHAT_IDS = set(data)
+
+    except Exception as e:
+
+        print("读取chat_ids失败:", e)
+
+
+def save_chat_ids():
+
+    try:
+
+        with open(
+            CHAT_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                list(CHAT_IDS),
+                f
+            )
+
+    except Exception as e:
+
+        print("保存chat_ids失败:", e)
+
+
+# =========================================================
+# Telegram /start
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if update.effective_chat:
+
+        chat_id = update.effective_chat.id
+
+        CHAT_IDS.add(chat_id)
+
+        save_chat_ids()
+
+    await update.message.reply_text(
+
+        "机器人启动成功！🎉\n\n"
+
+        "📊 Vegas + MACD + TD9 信号机器人\n\n"
+
+        f"监控币种：{len(SYMBOLS)}个\n"
+
+        "方向：1H EMA12/144/169/576/676\n"
+
+        "入场：15M 144/169回踩 + MACD动能\n"
+
+        "辅助：TD9\n\n"
+
+        "🟢 多头：1H趋势向上\n"
+
+        "🔴 空头：1H趋势向下\n\n"
+
+        "机器人现在开始监控。"
+
+    )
+
+
+# =========================================================
+# HTTP健康检查
+# =========================================================
+
+class HealthHandler(
+    BaseHTTPRequestHandler
+):
 
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Telegram trading bot is running!")
 
-    def log_message(self, format, *args):
+        self.send_response(200)
+
+        self.end_headers()
+
+        self.wfile.write(
+            b"Telegram Vegas trading bot is running!"
+        )
+
+    def log_message(
+        self,
+        format,
+        *args
+    ):
+
         pass
 
 
 def run_web_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
+
     server.serve_forever()
 
 
-threading.Thread(
-    target=run_web_server,
-    daemon=True
-).start()
-
-
-# ============================================================
-# Telegram Chat ID 管理
-# ============================================================
-
-def load_chat_ids():
-    try:
-        with open(CHAT_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def save_chat_ids(chat_ids):
-    try:
-        with open(CHAT_FILE, "w", encoding="utf-8") as f:
-            json.dump(chat_ids, f)
-    except Exception:
-        pass
-
-
-CHAT_IDS = load_chat_ids()
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_chat is None:
-        return
-
-    chat_id = update.effective_chat.id
-
-    if chat_id not in CHAT_IDS:
-        CHAT_IDS.append(chat_id)
-        save_chat_ids(CHAT_IDS)
-
-    await update.message.reply_text(
-        "机器人启动成功！🎉\n\n"
-        "📊 Vegas + MACD + TD9 信号机器人\n"
-        "监控币种：45个\n"
-        "方向：1H EMA\n"
-        "入场：15M MACD\n"
-        "辅助：TD9\n\n"
-        "现在已经开始监控。"
-    )
-
-
-# ============================================================
+# =========================================================
 # Binance K线
-# ============================================================
+# =========================================================
 
-def get_klines(symbol, interval, limit=700):
+def get_klines(
+    symbol,
+    interval,
+    limit=800
+):
 
     params = urlencode({
+
         "symbol": symbol,
+
         "interval": interval,
+
         "limit": limit
+
     })
 
-    url = BINANCE_API + "?" + params
+    url = (
+        BINANCE_API
+        + "?"
+        + params
+    )
 
     request = Request(
+
         url,
+
         headers={
             "User-Agent": "Mozilla/5.0"
         }
+
     )
 
     try:
-        with urlopen(request, timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
+
+        with urlopen(
+            request,
+            timeout=15
+        ) as response:
+
+            data = json.loads(
+                response
+                .read()
+                .decode("utf-8")
+            )
 
         return data
 
     except Exception as e:
-        print(f"{symbol} {interval} K线获取失败:", e)
+
+        print(
+            f"{symbol} {interval} K线获取失败:",
+            e
+        )
+
         return []
 
 
-# ============================================================
-# EMA
-# ============================================================
+# =========================================================
+# 获取Binance有效永续合约
+# =========================================================
 
-def ema(values, period):
+def load_valid_symbols():
+
+    global VALID_SYMBOLS
+
+    try:
+
+        request = Request(
+
+            BINANCE_EXCHANGE_INFO,
+
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            }
+
+        )
+
+        with urlopen(
+            request,
+            timeout=20
+        ) as response:
+
+            data = json.loads(
+                response
+                .read()
+                .decode("utf-8")
+            )
+
+        for item in data.get(
+            "symbols",
+            []
+        ):
+
+            symbol = item.get(
+                "symbol"
+            )
+
+            contract_type = item.get(
+                "contractType"
+            )
+
+            status = item.get(
+                "status"
+            )
+
+            quote_asset = item.get(
+                "quoteAsset"
+            )
+
+            if (
+
+                contract_type
+                == "PERPETUAL"
+
+                and status
+                == "TRADING"
+
+                and quote_asset
+                == "USDT"
+
+            ):
+
+                VALID_SYMBOLS.add(
+                    symbol
+                )
+
+        print(
+            "Binance有效USDT永续数量:",
+            len(VALID_SYMBOLS)
+        )
+
+    except Exception as e:
+
+        print(
+            "获取Binance合约列表失败:",
+            e
+        )
+
+        # 如果获取失败，
+        # 暂时使用原始列表
+        VALID_SYMBOLS = set(
+            SYMBOLS
+        )
+
+
+# =========================================================
+# EMA
+# =========================================================
+
+def ema(
+    values,
+    period
+):
 
     if len(values) < period:
+
         return []
 
-    multiplier = 2 / (period + 1)
+    multiplier = (
+        2
+        / (period + 1)
+    )
 
-    result = [sum(values[:period]) / period]
+    result = []
+
+    value = sum(
+        values[:period]
+    ) / period
+
+    result.append(value)
 
     for price in values[period:]:
-        result.append(
-            (price - result[-1]) * multiplier + result[-1]
+
+        value = (
+            (price - value)
+            * multiplier
+            + value
         )
+
+        result.append(value)
 
     return result
 
 
-# ============================================================
+def ema_series(
+    values,
+    period
+):
+
+    if len(values) < period:
+
+        return []
+
+    multiplier = (
+        2
+        / (period + 1)
+    )
+
+    result = [
+        None
+    ] * (
+        period - 1
+    )
+
+    value = sum(
+        values[:period]
+    ) / period
+
+    result.append(value)
+
+    for price in values[period:]:
+
+        value = (
+            (price - value)
+            * multiplier
+            + value
+        )
+
+        result.append(value)
+
+    return result
+
+
+# =========================================================
 # MACD
-# 标准参数：12 / 26 / 9
-# ============================================================
+# =========================================================
 
-def calculate_macd(closes):
+def calculate_macd(
+    closes
+):
 
-    if len(closes) < 35:
-        return None
+    ema12 = ema_series(
+        closes,
+        12
+    )
 
-    ema12 = ema(closes, 12)
-    ema26 = ema(closes, 26)
-
-    # 对齐
-    offset = 26 - 12
+    ema26 = ema_series(
+        closes,
+        26
+    )
 
     macd_line = []
 
-    for i in range(len(ema26)):
-        macd_line.append(
-            ema12[i + offset] - ema26[i]
-        )
+    for i in range(
+        len(closes)
+    ):
 
-    if len(macd_line) < 10:
-        return None
+        if (
+            ema12[i] is None
+            or ema26[i] is None
+        ):
 
-    signal_line = ema(macd_line, 9)
-
-    if not signal_line:
-        return None
-
-    signal_offset = 9 - 1
-
-    macd_now = macd_line[-1]
-    macd_prev = macd_line[-2]
-
-    signal_now = signal_line[-1]
-    signal_prev = signal_line[-2]
-
-    golden_cross = (
-        macd_prev <= signal_prev
-        and macd_now > signal_now
-    )
-
-    death_cross = (
-        macd_prev >= signal_prev
-        and macd_now < signal_now
-    )
-
-    return {
-        "macd": macd_now,
-        "signal": signal_now,
-        "golden_cross": golden_cross,
-        "death_cross": death_cross
-    }
-
-
-# ============================================================
-# TD9
-# 简化版 TD Sequential
-#
-# 收盘价 > 4根K线前收盘：上涨计数
-# 收盘价 < 4根K线前收盘：下跌计数
-# ============================================================
-
-def calculate_td9(closes):
-
-    if len(closes) < 10:
-        return {
-            "direction": "无",
-            "count": 0
-        }
-
-    up_count = 0
-    down_count = 0
-
-    # 从最近一根往前统计
-    for i in range(len(closes) - 1, 3, -1):
-
-        current = closes[i]
-        four_back = closes[i - 4]
-
-        if current > four_back:
-
-            if down_count > 0:
-                break
-
-            up_count += 1
-
-            if up_count >= 9:
-                break
-
-        elif current < four_back:
-
-            if up_count > 0:
-                break
-
-            down_count += 1
-
-            if down_count >= 9:
-                break
+            macd_line.append(None)
 
         else:
+
+            macd_line.append(
+                ema12[i]
+                - ema26[i]
+            )
+
+    valid_macd = [
+
+        x
+        for x in macd_line
+        if x is not None
+
+    ]
+
+    signal_values = ema_series(
+        valid_macd,
+        9
+    )
+
+    signal_line = [
+        None
+    ] * (
+        len(closes)
+        - len(signal_values)
+    )
+
+    signal_line += signal_values
+
+    histogram = []
+
+    for i in range(
+        len(closes)
+    ):
+
+        if (
+            macd_line[i] is None
+            or signal_line[i] is None
+        ):
+
+            histogram.append(None)
+
+        else:
+
+            histogram.append(
+                macd_line[i]
+                - signal_line[i]
+            )
+
+    return (
+        macd_line,
+        signal_line,
+        histogram
+    )
+
+
+# =========================================================
+# MACD多头动能重新增强
+# =========================================================
+
+def macd_long_restrength(
+    histogram
+):
+
+    values = [
+
+        x
+        for x in histogram
+        if x is not None
+
+    ]
+
+    if len(values) < 5:
+
+        return False
+
+    h4 = values[-4]
+    h3 = values[-3]
+    h2 = values[-2]
+    h1 = values[-1]
+
+    # 前面至少两根连续减弱
+    weakening = (
+        h3 < h4
+        and
+        h2 < h3
+    )
+
+    # 最新一根重新增强
+    strengthening = (
+        h1 > h2
+    )
+
+    return (
+        weakening
+        and
+        strengthening
+    )
+
+
+# =========================================================
+# MACD空头动能重新增强
+# =========================================================
+
+def macd_short_restrength(
+    histogram
+):
+
+    values = [
+
+        x
+        for x in histogram
+        if x is not None
+
+    ]
+
+    if len(values) < 5:
+
+        return False
+
+    h4 = values[-4]
+    h3 = values[-3]
+    h2 = values[-2]
+    h1 = values[-1]
+
+    weakening = (
+        h3 > h4
+        and
+        h2 > h3
+    )
+
+    strengthening = (
+        h1 < h2
+    )
+
+    return (
+        weakening
+        and
+        strengthening
+    )
+
+
+# =========================================================
+# TD9
+# =========================================================
+
+def td9_count(
+    closes
+):
+
+    if len(closes) < 5:
+
+        return (
+            "未走完",
+            0,
+            0
+        )
+
+    up = 0
+    down = 0
+
+    for i in range(
+        len(closes) - 1,
+        3,
+        -1
+    ):
+
+        current = closes[i]
+
+        previous = closes[i - 4]
+
+        if current > previous:
+
+            up += 1
+
+            down = 0
+
+        elif current < previous:
+
+            down += 1
+
+            up = 0
+
+        else:
+
             break
 
-    if up_count > 0:
-        return {
-            "direction": "上涨",
-            "count": up_count
-        }
+        if (
+            up >= 9
+            or down >= 9
+        ):
 
-    if down_count > 0:
-        return {
-            "direction": "下跌",
-            "count": down_count
-        }
+            break
 
-    return {
-        "direction": "无",
-        "count": 0
-    }
+    if up >= 9:
+
+        return (
+            "上涨9",
+            up,
+            down
+        )
+
+    if down >= 9:
+
+        return (
+            "下跌9",
+            up,
+            down
+        )
+
+    return (
+        "未走完",
+        up,
+        down
+    )
 
 
-# ============================================================
-# 1H Vegas 方向
-#
-# EMA12 > EMA144/169 + 价格在144/169上方 = 多
-# EMA12 < EMA144/169 + 价格在144/169下方 = 空
-# ============================================================
+# =========================================================
+# 获取最近小高点
+# =========================================================
 
-def calculate_1h_direction(closes):
+def recent_swing_high(
+    highs
+):
 
-    if len(closes) < 200:
+    if len(highs) < 7:
+
         return None
 
-    ema12 = ema(closes, 12)
-    ema144 = ema(closes, 144)
-    ema169 = ema(closes, 169)
+    return max(
+        highs[-7:-1]
+    )
 
-    if not ema12 or not ema144 or not ema169:
+
+# =========================================================
+# 获取最近小低点
+# =========================================================
+
+def recent_swing_low(
+    lows
+):
+
+    if len(lows) < 7:
+
         return None
+
+    return min(
+        lows[-7:-1]
+    )
+
+
+# =========================================================
+# 1H趋势
+# =========================================================
+
+def get_1h_trend():
+
+    data = get_klines(
+        "",
+        ""
+    )
+
+    return None
+
+
+# =========================================================
+# 分析单个币种
+# =========================================================
+
+def analyze_symbol(
+    symbol
+):
+
+    # ---------------------------------
+    # 1H
+    # ---------------------------------
+
+    data_1h = get_klines(
+        symbol,
+        "1h",
+        800
+    )
+
+    if len(data_1h) < 700:
+
+        return None
+
+    # 去掉当前未收盘K线
+    closed_1h = data_1h[:-1]
+
+    closes_1h = [
+
+        float(x[4])
+        for x in closed_1h
+
+    ]
+
+    price_1h = closes_1h[-1]
+
+    ema12_1h = ema(
+        closes_1h,
+        12
+    )[-1]
+
+    ema144_1h = ema(
+        closes_1h,
+        144
+    )[-1]
+
+    ema169_1h = ema(
+        closes_1h,
+        169
+    )[-1]
+
+    ema576_1h = ema(
+        closes_1h,
+        576
+    )[-1]
+
+    ema676_1h = ema(
+        closes_1h,
+        676
+    )[-1]
+
+
+    # ---------------------------------
+    # 1H 多头
+    # ---------------------------------
+
+    long_trend = (
+
+        ema12_1h
+        > ema144_1h
+
+        and
+
+        ema12_1h
+        > ema169_1h
+
+        and
+
+        price_1h
+        > ema144_1h
+
+        and
+
+        price_1h
+        > ema169_1h
+
+        and
+
+        price_1h
+        > ema576_1h
+
+        and
+
+        price_1h
+        > ema676_1h
+
+    )
+
+
+    # ---------------------------------
+    # 1H 空头
+    # ---------------------------------
+
+    short_trend = (
+
+        ema12_1h
+        < ema144_1h
+
+        and
+
+        ema12_1h
+        < ema169_1h
+
+        and
+
+        price_1h
+        < ema144_1h
+
+        and
+
+        price_1h
+        < ema169_1h
+
+        and
+
+        price_1h
+        < ema576_1h
+
+        and
+
+        price_1h
+        < ema676_1h
+
+    )
+
+
+    if not long_trend and not short_trend:
+
+        return None
+
+
+    # ---------------------------------
+    # 15M
+    # ---------------------------------
+
+    data_15m = get_klines(
+        symbol,
+        "15m",
+        250
+    )
+
+    if len(data_15m) < 180:
+
+        return None
+
+    closed_15m = data_15m[:-1]
+
+
+    opens = [
+        float(x[1])
+        for x in closed_15m
+    ]
+
+    highs = [
+        float(x[2])
+        for x in closed_15m
+    ]
+
+    lows = [
+        float(x[3])
+        for x in closed_15m
+    ]
+
+    closes = [
+        float(x[4])
+        for x in closed_15m
+    ]
+
 
     price = closes[-1]
 
-    e12 = ema12[-1]
 
-    # 因为不同周期 EMA 长度不同，需要用最后值判断
-    e144 = ema144[-1]
-    e169 = ema169[-1]
+    # ---------------------------------
+    # 15M EMA144 / EMA169
+    # ---------------------------------
+
+    ema144_series = ema_series(
+        closes,
+        144
+    )
+
+    ema169_series = ema_series(
+        closes,
+        169
+    )
+
+    ema144 = ema144_series[-1]
+
+    ema169 = ema169_series[-1]
+
+
+    upper = max(
+        ema144,
+        ema169
+    )
+
+    lower = min(
+        ema144,
+        ema169
+    )
+
+
+    # ---------------------------------
+    # 用户确定的0.7%回踩区域
+    # ---------------------------------
+
+    long_zone_low = upper
+
+    long_zone_high = (
+        upper * 1.007
+    )
+
+    short_zone_low = (
+        lower * 0.993
+    )
+
+    short_zone_high = lower
+
+
+    # ---------------------------------
+    # 最近8根K线是否进入回踩区
+    # ---------------------------------
+
+    long_touched = False
+
+    short_touched = False
+
+    lookback_start = max(
+        0,
+        len(closes) - 8
+    )
+
+    for i in range(
+        lookback_start,
+        len(closes)
+    ):
+
+        candle_low = lows[i]
+
+        candle_high = highs[i]
+
+        # 多头：
+        # K线低点进入
+        # EMA144/169上边界
+        # 到上方0.7%的区域
+        if (
+
+            candle_low
+            >= long_zone_low
+
+            and
+
+            candle_low
+            <= long_zone_high
+
+        ):
+
+            long_touched = True
+
+
+        # 空头：
+        # K线高点进入
+        # 下边界向下0.7%的区域
+        if (
+
+            candle_high
+            <= short_zone_high
+
+            and
+
+            candle_high
+            >= short_zone_low
+
+        ):
+
+            short_touched = True
+
+
+    # ---------------------------------
+    # 避免明显穿透隧道
+    # ---------------------------------
+
+    latest_close = closes[-1]
+
+    if latest_close < lower:
+
+        long_touched = False
+
+    if latest_close > upper:
+
+        short_touched = False
+
+
+    # ---------------------------------
+    # MACD
+    # ---------------------------------
+
+    (
+        macd_line,
+        signal_line,
+        histogram
+    ) = calculate_macd(
+        closes
+    )
+
+
+    long_macd = (
+        macd_long_restrength(
+            histogram
+        )
+    )
+
+    short_macd = (
+        macd_short_restrength(
+            histogram
+        )
+
+
+    )
+
+
+    # ---------------------------------
+    # 小级别突破
+    # ---------------------------------
+
+    swing_high = recent_swing_high(
+        highs
+    )
+
+    swing_low = recent_swing_low(
+        lows
+    )
+
+
+    long_breakout = (
+
+        swing_high is not None
+
+        and
+
+        latest_close
+        > swing_high
+
+    )
+
+
+    short_breakout = (
+
+        swing_low is not None
+
+        and
+
+        latest_close
+        < swing_low
+
+    )
+
+
+    # ---------------------------------
+    # TD9
+    # ---------------------------------
+
+    (
+        td_status,
+        td_up,
+        td_down
+
+    ) = td9_count(
+        closes
+    )
+
+
+    # ---------------------------------
+    # 最终信号
+    # ---------------------------------
+
+    direction = None
+
 
     if (
-        e12 > e144
-        and e12 > e169
-        and price > e144
-        and price > e169
+
+        long_trend
+
+        and
+
+        long_touched
+
+        and
+
+        long_macd
+
+        and
+
+        long_breakout
+
     ):
-        return "多"
 
-    if (
-        e12 < e144
-        and e12 < e169
-        and price < e144
-        and price < e169
+        direction = "LONG"
+
+
+    elif (
+
+        short_trend
+
+        and
+
+        short_touched
+
+        and
+
+        short_macd
+
+        and
+
+        short_breakout
+
     ):
-        return "空"
 
-    return "震荡"
+        direction = "SHORT"
 
 
-# ============================================================
-# 分析一个币
-# ============================================================
+    if direction is None:
 
-def analyze_symbol(symbol):
-
-    # 1小时
-    klines_1h = get_klines(
-        symbol,
-        "1h",
-        700
-    )
-
-    if len(klines_1h) < 200:
         return None
 
-    closes_1h = [
-        float(k[4])
-        for k in klines_1h
-    ]
 
-    direction = calculate_1h_direction(
-        closes_1h
+    # ---------------------------------
+    # 信号时间
+    # ---------------------------------
+
+    candle_time = int(
+        closed_15m[-1][0]
     )
 
-    # 15分钟
-    klines_15m = get_klines(
-        symbol,
-        "15m",
-        200
-    )
-
-    if len(klines_15m) < 50:
-        return None
-
-    closes_15m = [
-        float(k[4])
-        for k in klines_15m
-    ]
-
-    macd = calculate_macd(
-        closes_15m
-    )
-
-    td9 = calculate_td9(
-        closes_15m
-    )
-
-    if macd is None:
-        return None
-
-    price = closes_15m[-1]
-
-    signal = None
-
-    # ========================================================
-    # Vegas + MACD
-    # ========================================================
-
-    if direction == "多" and macd["golden_cross"]:
-        signal = "LONG"
-
-    elif direction == "空" and macd["death_cross"]:
-        signal = "SHORT"
 
     return {
+
         "symbol": symbol,
-        "price": price,
+
         "direction": direction,
-        "macd": macd,
-        "td9": td9,
-        "signal": signal
+
+        "price": price,
+
+        "ema12_1h": ema12_1h,
+
+        "ema144_1h": ema144_1h,
+
+        "ema169_1h": ema169_1h,
+
+        "ema576_1h": ema576_1h,
+
+        "ema676_1h": ema676_1h,
+
+        "ema144_15m": ema144,
+
+        "ema169_15m": ema169,
+
+        "long_zone_low": long_zone_low,
+
+        "long_zone_high": long_zone_high,
+
+        "short_zone_low": short_zone_low,
+
+        "short_zone_high": short_zone_high,
+
+        "td_status": td_status,
+
+        "td_up": td_up,
+
+        "td_down": td_down,
+
+        "candle_time": candle_time
+
     }
 
 
-# ============================================================
-# 格式化信号
-# ============================================================
+# =========================================================
+# 格式化价格
+# =========================================================
 
-def format_signal(data):
+def format_price(
+    price
+):
 
-    symbol = data["symbol"]
-    coin = symbol.replace("USDT", "")
+    if price >= 1000:
 
-    price = data["price"]
+        return f"{price:,.2f}"
 
-    direction = data["direction"]
+    if price >= 1:
 
-    macd = data["macd"]
-    td9 = data["td9"]
+        return f"{price:.4f}"
 
-    if data["signal"] == "LONG":
+    if price >= 0.01:
+
+        return f"{price:.6f}"
+
+    return f"{price:.8f}"
+
+
+# =========================================================
+# 生成信号消息
+# =========================================================
+
+def build_message(
+    signal
+):
+
+    symbol = signal["symbol"]
+
+    direction = signal["direction"]
+
+    price = signal["price"]
+
+
+    if direction == "LONG":
 
         title = "🟢 做多信号"
 
+        trend = "1H 多头趋势"
+
+        zone = (
+
+            f"{format_price(signal['long_zone_low'])}"
+
+            " → "
+
+            f"{format_price(signal['long_zone_high'])}"
+
+        )
+
         reason = (
-            "1H Vegas方向：多头\n"
-            "15M MACD：金叉"
+
+            "价格回踩144/169隧道上边界"
+
+            " + 0.7%区域\n"
+
+            "MACD动能重新增强\n"
+
+            "突破15M近期小高点"
+
         )
 
     else:
 
         title = "🔴 做空信号"
 
-        reason = (
-            "1H Vegas方向：空头\n"
-            "15M MACD：死叉"
+        trend = "1H 空头趋势"
+
+        zone = (
+
+            f"{format_price(signal['short_zone_low'])}"
+
+            " → "
+
+            f"{format_price(signal['short_zone_high'])}"
+
         )
 
-    if td9["direction"] == "上涨":
-        td9_text = f"上涨计数 {td9['count']}"
+        reason = (
 
-    elif td9["direction"] == "下跌":
-        td9_text = f"下跌计数 {td9['count']}"
+            "价格反弹至144/169隧道下边界"
 
-    else:
-        td9_text = "无明显计数"
+            " - 0.7%区域\n"
 
-    now = datetime.now(
-        timezone.utc
-    ).astimezone()
+            "MACD动能重新转弱\n"
 
-    message = (
-        f"🚨 <b>{coin}USDT 永续</b>\n\n"
-        f"<b>{title}</b>\n\n"
-        f"💰 当前价格：<code>{price:g}</code>\n\n"
-        f"📊 {reason}\n"
-        f"TD9：{td9_text}\n\n"
-        f"⏱ 方向周期：1H\n"
-        f"🎯 入场周期：15M\n"
-        f"📈 策略：Vegas + MACD + TD9\n\n"
-        f"时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
+            "跌破15M近期小低点"
+
+        )
+
+
+    candle_time = datetime.fromtimestamp(
+
+        signal["candle_time"] / 1000
+
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S"
     )
 
-    return message
+
+    return (
+
+        f"📊 {symbol} 15M\n\n"
+
+        f"{title}\n\n"
+
+        f"💰 当前价格："
+        f"{format_price(price)}\n"
+
+        f"📈 1H方向：{trend}\n\n"
+
+        "EMA趋势过滤：\n"
+
+        f"EMA12："
+        f"{format_price(signal['ema12_1h'])}\n"
+
+        f"EMA144："
+        f"{format_price(signal['ema144_1h'])}\n"
+
+        f"EMA169："
+        f"{format_price(signal['ema169_1h'])}\n"
+
+        f"EMA576："
+        f"{format_price(signal['ema576_1h'])}\n"
+
+        f"EMA676："
+        f"{format_price(signal['ema676_1h'])}\n\n"
+
+        "🎯 15M回踩区域：\n"
+
+        f"{zone}\n\n"
+
+        "📌 入场确认：\n"
+
+        f"{reason}\n\n"
+
+        f"TD9：{signal['td_status']} "
+        f"(上涨{signal['td_up']} / "
+        f"下跌{signal['td_down']})\n\n"
+
+        f"⏰ K线时间：{candle_time}\n\n"
+
+        "⚠️ 仅作为交易信号参考，"
+        "不是自动下单。"
+
+    )
 
 
-# ============================================================
-# 扫描所有币
-# ============================================================
+# =========================================================
+# 发送消息
+# =========================================================
 
-async def scanner(application):
+async def send_signal(
+    bot,
+    signal
+):
 
-    print("交易信号扫描器启动")
+    message = build_message(
+        signal
+    )
+
+    for chat_id in list(
+        CHAT_IDS
+    ):
+
+        try:
+
+            await bot.send_message(
+
+                chat_id=chat_id,
+
+                text=message
+
+            )
+
+        except Exception as e:
+
+            print(
+                f"发送到 {chat_id} 失败:",
+                e
+            )
+
+
+# =========================================================
+# 扫描器
+# =========================================================
+
+async def scanner(
+    application
+):
+
+    print(
+        "扫描器启动"
+    )
 
     while True:
 
         try:
 
+            if not VALID_SYMBOLS:
+
+                await asyncio_sleep(
+                    5
+                )
+
+                continue
+
+
             print(
-                f"\n开始扫描 {len(SYMBOLS)} 个币..."
+                "开始扫描",
+                len(SYMBOLS),
+                "个币..."
             )
+
 
             for symbol in SYMBOLS:
 
+                # Binance没有这个永续
+                if symbol not in VALID_SYMBOLS:
+
+                    print(
+                        symbol,
+                        "不是当前有效USDT永续，跳过"
+                    )
+
+                    continue
+
+
                 try:
 
-                    data = await asyncio.to_thread(
-                        analyze_symbol,
+                    signal = analyze_symbol(
                         symbol
                     )
 
-                    if data is None:
-                        continue
-
-                    signal = data["signal"]
 
                     if signal is None:
+
                         continue
 
-                    # 当前K线时间 + 信号类型
-                    klines = await asyncio.to_thread(
-                        get_klines,
-                        symbol,
-                        "15m",
-                        2
+
+                    key = (
+
+                        signal["symbol"],
+
+                        signal["direction"],
+
+                        signal["candle_time"]
+
                     )
 
-                    if len(klines) < 2:
+
+                    # 防重复
+                    if key in LAST_SIGNALS:
+
                         continue
 
-                    candle_time = klines[-1][0]
 
-                    signal_key = (
-                        symbol,
-                        signal,
-                        candle_time
-                    )
+                    LAST_SIGNALS[key] = True
 
-                    # 已经发送过，不重复发送
-                    if signal_key in last_signals:
-                        continue
-
-                    last_signals[signal_key] = True
-
-                    message = format_signal(
-                        data
-                    )
-
-                    # 发到所有已经 /start 的聊天
-                    for chat_id in CHAT_IDS.copy():
-
-                        try:
-
-                            await application.bot.send_message(
-                                chat_id=chat_id,
-                                text=message,
-                                parse_mode="HTML"
-                            )
-
-                        except Exception as e:
-
-                            print(
-                                f"发送到 {chat_id} 失败:",
-                                e
-                            )
 
                     print(
-                        f"发现信号：{symbol} {signal}"
+                        "发现信号:",
+                        signal["symbol"],
+                        signal["direction"]
                     )
+
+
+                    await send_signal(
+                        application.bot,
+                        signal
+                    )
+
 
                 except Exception as e:
 
                     print(
-                        f"{symbol} 分析失败:",
+                        symbol,
+                        "分析失败:",
                         e
                     )
 
-            print("本轮扫描完成")
+
+                # 稍微停一下
+                await asyncio_sleep(
+                    0.15
+                )
+
 
         except Exception as e:
 
@@ -611,47 +1572,139 @@ async def scanner(application):
                 e
             )
 
-        # 每3分钟扫描一次
-        await asyncio.sleep(180)
+
+        print(
+            f"{SCAN_INTERVAL}秒后重新扫描..."
+        )
 
 
-# ============================================================
-# Application 启动
-# ============================================================
+        await asyncio_sleep(
+            SCAN_INTERVAL
+        )
 
-async def post_init(application):
 
-    application.create_task(
-        scanner(application)
+# =========================================================
+# 异步sleep
+# =========================================================
+
+async def asyncio_sleep(
+    seconds
+):
+
+    import asyncio
+
+    await asyncio.sleep(
+        seconds
     )
 
 
-# ============================================================
-# 启动 Telegram
-# ============================================================
+# =========================================================
+# 主程序
+# =========================================================
 
-if not TOKEN:
+def main():
 
-    raise RuntimeError(
-        "没有找到 BOT_TOKEN 环境变量"
+    if not TOKEN:
+
+        raise RuntimeError(
+            "没有找到 BOT_TOKEN"
+        )
+
+
+    load_chat_ids()
+
+
+    load_valid_symbols()
+
+
+    print(
+        "================================"
+    )
+
+    print(
+        "Vegas + MACD + TD9"
+    )
+
+    print(
+        "Telegram Trading Signal Bot"
+    )
+
+    print(
+        "监控币种:",
+        len(SYMBOLS)
+    )
+
+    print(
+        "有效币种:",
+        len(
+            [
+                x
+                for x in SYMBOLS
+                if x in VALID_SYMBOLS
+            ]
+        )
+    )
+
+    print(
+        "================================"
     )
 
 
-app = (
-    Application.builder()
-    .token(TOKEN)
-    .post_init(post_init)
-    .build()
-)
+    # Render健康检查
+    threading.Thread(
 
-app.add_handler(
-    CommandHandler(
-        "start",
-        start
+        target=run_web_server,
+
+        daemon=True
+
+    ).start()
+
+
+    application = (
+
+        Application
+        .builder()
+        .token(TOKEN)
+        .build()
+
     )
-)
 
 
-print("Telegram Trading Bot 启动中...")
+    application.add_handler(
 
-app.run_polling()
+        CommandHandler(
+            "start",
+            start
+        )
+
+    )
+
+
+    async def post_init(
+        app
+    ):
+
+        import asyncio
+
+        asyncio.create_task(
+
+            scanner(
+                app
+            )
+
+        )
+
+
+    application.post_init = post_init
+
+
+    application.run_polling()
+
+
+# =========================================================
+# 启动
+# =========================================================
+
+if __name__ == "__main__":
+
+    main()
