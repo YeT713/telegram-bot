@@ -1,99 +1,50 @@
 import os
 import time
-import asyncio
 import threading
-import requests
-
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 
 
 # ============================================================
 # 基础配置
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID", "8289465171")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "8289465171").strip()
 
 BYBIT_URL = "https://api.bybit.com"
+TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 PORT = int(os.getenv("PORT", "10000"))
 
-COOLDOWN_SECONDS = 4 * 60 * 60
+# 每4小时同一币种最多发一次信号
+SIGNAL_COOLDOWN = 4 * 60 * 60
 
+# 扫描间隔
+SCAN_INTERVAL = 60
 
-# ============================================================
-# 监控币种：62个
-# ============================================================
-
+# 监控币种
 SYMBOLS = [
-    # Core 45
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "TRXUSDT",
-    "DOGEUSDT",
-    "ADAUSDT",
-    "HYPEUSDT",
-    "ZECUSDT",
-    "BCHUSDT",
-    "LINKUSDT",
-    "AVAXUSDT",
-    "XLMUSDT",
-    "SUIUSDT",
-    "TONUSDT",
-    "HBARUSDT",
-    "SHIBUSDT",
-    "LTCUSDT",
-    "DOTUSDT",
-    "UNIUSDT",
-    "NEARUSDT",
-    "ICPUSDT",
-    "XMRUSDT",
-    "APTUSDT",
-    "TAOUSDT",
-    "ATOMUSDT",
-    "ARBUSDT",
-    "CROUSDT",
-    "VETUSDT",
-    "FILUSDT",
-    "ALGOUSDT",
-    "RENDERUSDT",
-    "INJUSDT",
-    "OPUSDT",
-    "IMXUSDT",
-    "AAVEUSDT",
-    "GRTUSDT",
-    "SEIUSDT",
-    "QNTUSDT",
-    "THETAUSDT",
-    "TIAUSDT",
-    "MKRUSDT",
-    "MNTUSDT",
-    "PEPEUSDT",
+    # 核心45
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "TRXUSDT", "DOGEUSDT", "ADAUSDT", "HYPEUSDT", "ZECUSDT",
+    "BCHUSDT", "LINKUSDT", "AVAXUSDT", "XLMUSDT", "SUIUSDT",
+    "TONUSDT", "HBARUSDT", "SHIBUSDT", "LTCUSDT", "DOTUSDT",
+    "UNIUSDT", "NEARUSDT", "ICPUSDT", "XMRUSDT", "APTUSDT",
+    "TAOUSDT", "ATOMUSDT", "ARBUSDT", "CROUSDT", "VETUSDT",
+    "FILUSDT", "ALGOUSDT", "RENDERUSDT", "INJUSDT", "OPUSDT",
+    "IMXUSDT", "AAVEUSDT", "GRTUSDT", "SEIUSDT", "QNTUSDT",
+    "THETAUSDT", "TIAUSDT", "MKRUSDT", "MNTUSDT", "PEPEUSDT",
 
-    # Extension 10
-    "WIFUSDT",
-    "BONKUSDT",
-    "FLOKIUSDT",
-    "JUPUSDT",
-    "ENAUSDT",
-    "ONDOUSDT",
-    "RUNEUSDT",
-    "WLDUSDT",
-    "STXUSDT",
-    "CRVUSDT",
+    # 扩展10
+    "WIFUSDT", "BONKUSDT", "FLOKIUSDT", "JUPUSDT", "ENAUSDT",
+    "ONDOUSDT", "RUNEUSDT", "WLDUSDT", "STXUSDT", "CRVUSDT",
 
-    # Extension 7
-    "MAGMAUSDT",
-    "FFUSDT",
-    "LISKUSDT",
-    "ARKUSDT",
-    "EMBERUSDT",
-    "PENGUUSDT",
-    "JASMYUSDT",
+    # 扩展7
+    "MAGMAUSDT", "FFUSDT", "LISKUSDT", "ARKUSDT",
+    "EMBERUSDT", "PENGUUSDT", "JASMYUSDT",
 ]
 
 
@@ -101,176 +52,335 @@ SYMBOLS = [
 # 全局状态
 # ============================================================
 
+session = requests.Session()
+
 last_signal_time = {}
+state_lock = threading.Lock()
+
+scanner_running = False
+telegram_running = False
 
 telegram_offset = 0
 
 
 # ============================================================
-# Render Web Service 健康端口
+# HTTP健康检查
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+        body = b"Vegas Trading Bot is running."
 
         self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
 
-        self.wfile.write(
-            b"Vegas Trading Bot is running."
-        )
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
         return
 
 
 def start_web_server():
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
 
-    print(
-        f"HTTP health server starting on port {PORT}"
-    )
+        print(
+            f"[WEB] HTTP health server started on port {PORT}",
+            flush=True
+        )
 
-    server = HTTPServer(
-        ("0.0.0.0", PORT),
-        HealthHandler
-    )
+        server.serve_forever()
 
-    print(
-        f"HTTP health server started on port {PORT}"
-    )
-
-    server.serve_forever()
+    except Exception as e:
+        print(
+            f"[WEB ERROR] {repr(e)}",
+            flush=True
+        )
 
 
 # ============================================================
 # Telegram
 # ============================================================
 
-def telegram_url(method):
+def telegram_request(method, data=None, timeout=30):
+    try:
+        response = session.post(
+            f"{TELEGRAM_URL}/{method}",
+            data=data or {},
+            timeout=timeout
+        )
 
-    return (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/{method}"
+        return response.json()
+
+    except Exception as e:
+        print(
+            f"[TELEGRAM ERROR] {method}: {repr(e)}",
+            flush=True
+        )
+
+        return None
+
+
+def send_message(text, chat_id=None):
+    target = chat_id or CHAT_ID
+
+    if not BOT_TOKEN:
+        print(
+            "[TELEGRAM ERROR] BOT_TOKEN is empty",
+            flush=True
+        )
+        return False
+
+    result = telegram_request(
+        "sendMessage",
+        {
+            "chat_id": target,
+            "text": text,
+        },
+        timeout=20
+    )
+
+    if not result:
+        return False
+
+    if not result.get("ok"):
+        print(
+            f"[TELEGRAM SEND ERROR] {result}",
+            flush=True
+        )
+        return False
+
+    return True
+
+
+def telegram_startup_check():
+    print("[TELEGRAM] Checking bot token...", flush=True)
+
+    result = telegram_request(
+        "getMe",
+        timeout=20
+    )
+
+    if not result:
+        print(
+            "[TELEGRAM] getMe failed",
+            flush=True
+        )
+        return False
+
+    if not result.get("ok"):
+        print(
+            f"[TELEGRAM] getMe error: {result}",
+            flush=True
+        )
+        return False
+
+    bot = result["result"]
+
+    print(
+        f"[TELEGRAM] BOT OK: @{bot.get('username')}",
+        flush=True
+    )
+
+    return True
+
+
+def remove_webhook():
+    print(
+        "[TELEGRAM] Removing webhook...",
+        flush=True
+    )
+
+    result = telegram_request(
+        "deleteWebhook",
+        {
+            "drop_pending_updates": False
+        },
+        timeout=20
+    )
+
+    print(
+        f"[TELEGRAM] deleteWebhook result: {result}",
+        flush=True
     )
 
 
-def send_message(text):
+def handle_command(message):
+    text = message.get("text", "").strip()
 
-    if not BOT_TOKEN:
+    chat = message.get("chat", {})
+    chat_id = str(chat.get("id", ""))
 
-        print("❌ BOT_TOKEN 未设置")
+    username = chat.get("username", "")
+    chat_type = chat.get("type", "")
 
-        return False
+    print(
+        f"[TELEGRAM] Message received | "
+        f"chat_id={chat_id} | "
+        f"type={chat_type} | "
+        f"user={username} | "
+        f"text={text}",
+        flush=True
+    )
 
-    try:
+    # /start
+    if text.startswith("/start"):
 
-        response = requests.post(
-            telegram_url("sendMessage"),
-            json={
-                "chat_id": CHAT_ID,
-                "text": text
-            },
-            timeout=20
+        reply = (
+            "🤖 Vegas Trading Bot 已启动\n\n"
+            "📊 策略：Vegas EMA 12 / 144 / 169 / 576 / 676\n"
+            "⏱ 周期：1H 定方向 + 15M 找入场\n"
+            "💰 数据源：Bybit\n"
+            f"📈 监控币种：{len(SYMBOLS)} 个\n\n"
+            "可用命令：\n"
+            "/status\n"
+            "/debug BTCUSDT"
         )
 
-        if response.status_code != 200:
+        send_message(
+            reply,
+            chat_id
+        )
 
-            print(
-                "Telegram发送失败:",
-                response.status_code,
-                response.text
+        return
+
+    # /status
+    if text.startswith("/status"):
+
+        with state_lock:
+            count = len(last_signal_time)
+
+        reply = (
+            "🤖 Vegas Trading Bot\n\n"
+            "运行状态：🟢 正常\n"
+            f"Telegram：{'🟢' if telegram_running else '🔴'}\n"
+            f"策略扫描：{'🟢' if scanner_running else '🔴'}\n"
+            f"监控币种：{len(SYMBOLS)}\n"
+            f"最近信号记录：{count}\n\n"
+            "策略：Vegas EMA 12/144/169/576/676\n"
+            "方向：1H\n"
+            "入场：15M"
+        )
+
+        send_message(
+            reply,
+            chat_id
+        )
+
+        return
+
+    # /debug
+    if text.startswith("/debug"):
+
+        parts = text.split()
+
+        if len(parts) < 2:
+            send_message(
+                "用法：/debug BTCUSDT",
+                chat_id
             )
+            return
 
-            return False
+        symbol = parts[1].upper()
 
-        return True
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
 
-    except Exception as e:
-
-        print(
-            "Telegram发送异常:",
-            e
+        debug_symbol(
+            symbol,
+            chat_id
         )
 
-        return False
+        return
 
 
-def get_updates():
+def telegram_polling():
 
     global telegram_offset
+    global telegram_running
 
     if not BOT_TOKEN:
-        return []
-
-    try:
-
-        response = requests.get(
-            telegram_url("getUpdates"),
-            params={
-                "offset": telegram_offset,
-                "timeout": 10
-            },
-            timeout=20
+        print(
+            "[TELEGRAM ERROR] BOT_TOKEN is empty!",
+            flush=True
         )
+        return
 
-        if response.status_code != 200:
+    if not telegram_startup_check():
+        return
+
+    remove_webhook()
+
+    telegram_running = True
+
+    print(
+        "[TELEGRAM] Polling started successfully.",
+        flush=True
+    )
+
+    while True:
+
+        try:
+
+            result = telegram_request(
+                "getUpdates",
+                {
+                    "offset": telegram_offset,
+                    "timeout": 20,
+                    "allowed_updates": '["message"]'
+                },
+                timeout=30
+            )
+
+            if not result:
+                time.sleep(3)
+                continue
+
+            if not result.get("ok"):
+
+                print(
+                    f"[TELEGRAM GETUPDATES ERROR] {result}",
+                    flush=True
+                )
+
+                time.sleep(5)
+                continue
+
+            updates = result.get("result", [])
+
+            for update in updates:
+
+                telegram_offset = update["update_id"] + 1
+
+                message = update.get("message")
+
+                if not message:
+                    continue
+
+                handle_command(message)
+
+        except Exception as e:
 
             print(
-                "Telegram getUpdates失败:",
-                response.status_code
+                f"[TELEGRAM LOOP ERROR] {repr(e)}",
+                flush=True
             )
 
-            return []
-
-        data = response.json()
-
-        if not data.get("ok"):
-
-            return []
-
-        updates = data.get(
-            "result",
-            []
-        )
-
-        if updates:
-
-            telegram_offset = (
-                updates[-1]["update_id"] + 1
-            )
-
-        return updates
-
-    except Exception as e:
-
-        print(
-            "Telegram获取消息异常:",
-            e
-        )
-
-        return []
+            time.sleep(5)
 
 
 # ============================================================
-# Bybit K线
+# Bybit
 # ============================================================
 
-def get_klines(
-    symbol,
-    interval,
-    limit=700
-):
+def bybit_kline(symbol, interval, limit=250):
 
     try:
 
-        response = requests.get(
+        response = session.get(
             f"{BYBIT_URL}/v5/market/kline",
             params={
                 "category": "linear",
@@ -278,56 +388,40 @@ def get_klines(
                 "interval": interval,
                 "limit": limit
             },
-            timeout=20
+            timeout=15
         )
-
-        if response.status_code != 200:
-
-            print(
-                f"{symbol} Bybit HTTP错误:",
-                response.status_code
-            )
-
-            return []
 
         data = response.json()
 
         if data.get("retCode") != 0:
 
             print(
-                f"{symbol} Bybit API错误:",
-                data
+                f"[BYBIT] {symbol} {interval} "
+                f"retCode={data.get('retCode')} "
+                f"msg={data.get('retMsg')}",
+                flush=True
             )
 
-            return []
+            return None
 
-        rows = (
-            data
-            .get("result", {})
-            .get("list", [])
-        )
+        rows = data.get("result", {}).get("list", [])
 
-        # Bybit返回最新K线在前
-        rows = list(reversed(rows))
+        if not rows:
+            return None
+
+        # Bybit 返回通常为最新 -> 最旧
+        rows.reverse()
 
         candles = []
 
         for row in rows:
 
             candles.append({
-
                 "time": int(row[0]),
-
                 "open": float(row[1]),
-
                 "high": float(row[2]),
-
                 "low": float(row[3]),
-
                 "close": float(row[4]),
-
-                "volume": float(row[5])
-
             })
 
         return candles
@@ -335,1227 +429,707 @@ def get_klines(
     except Exception as e:
 
         print(
-            f"{symbol} Bybit请求异常:",
-            e
+            f"[BYBIT ERROR] {symbol} {interval}: {repr(e)}",
+            flush=True
         )
 
-        return []
+        return None
 
 
-# ============================================================
-# EMA
-# ============================================================
-
-def calculate_ema(values, period):
+def ema(values, period):
 
     if len(values) < period:
-
-        return [None] * len(values)
-
-    result = [None] * len(values)
-
-    initial = (
-        sum(values[:period])
-        / period
-    )
-
-    result[period - 1] = initial
+        return None
 
     multiplier = 2 / (period + 1)
 
-    previous = initial
+    result = sum(values[:period]) / period
 
-    for i in range(
-        period,
-        len(values)
-    ):
+    for price in values[period:]:
+
+        result = (
+            price - result
+        ) * multiplier + result
+
+    return result
+
+
+def calculate_ema_series(values, period):
+
+    if len(values) < period:
+        return [None] * len(values)
+
+    result = [None] * (period - 1)
+
+    current = sum(values[:period]) / period
+
+    result.append(current)
+
+    multiplier = 2 / (period + 1)
+
+    for price in values[period:]:
 
         current = (
-            (values[i] - previous)
-            * multiplier
-            + previous
-        )
+            price - current
+        ) * multiplier + current
 
-        result[i] = current
-
-        previous = current
+        result.append(current)
 
     return result
 
 
-def add_indicators(candles):
+# ============================================================
+# 1H方向
+# ============================================================
+
+def get_1h_direction(candles):
+
+    if not candles or len(candles) < 700:
+        return "NEUTRAL"
+
+    # 最后一根可能是未完成K线
+    closed = candles[:-1]
 
     closes = [
-        candle["close"]
-        for candle in candles
+        x["close"]
+        for x in closed
     ]
 
-    ema12 = calculate_ema(
-        closes,
-        12
-    )
+    ema12 = ema(closes, 12)
+    ema144 = ema(closes, 144)
+    ema169 = ema(closes, 169)
+    ema576 = ema(closes, 576)
+    ema676 = ema(closes, 676)
 
-    ema144 = calculate_ema(
-        closes,
-        144
-    )
-
-    ema169 = calculate_ema(
-        closes,
-        169
-    )
-
-    ema576 = calculate_ema(
-        closes,
-        576
-    )
-
-    ema676 = calculate_ema(
-        closes,
-        676
-    )
-
-    result = []
-
-    for i, candle in enumerate(candles):
-
-        item = candle.copy()
-
-        item["ema12"] = ema12[i]
-        item["ema144"] = ema144[i]
-        item["ema169"] = ema169[i]
-        item["ema576"] = ema576[i]
-        item["ema676"] = ema676[i]
-
-        result.append(item)
-
-    return result
-
-
-# ============================================================
-# 1H Vegas严格方向
-# ============================================================
-
-def get_1h_direction(data):
-
-    if len(data) < 700:
-
+    if None in (
+        ema12,
+        ema144,
+        ema169,
+        ema576,
+        ema676
+    ):
         return "NEUTRAL"
 
-    # 最后一根通常是正在形成中的K线
-    # 使用最后一根已经完成的K线
-    candle = data[-2]
-
-    e12 = candle["ema12"]
-    e144 = candle["ema144"]
-    e169 = candle["ema169"]
-    e576 = candle["ema576"]
-    e676 = candle["ema676"]
-
-    close = candle["close"]
-
-    if None in [
-        e12,
-        e144,
-        e169,
-        e576,
-        e676
-    ]:
-
-        return "NEUTRAL"
+    close = closes[-1]
 
     bullish = (
-        e12 > e144
-        and e144 > e169
-        and e169 > e576
-        and e576 > e676
-        and close > e144
+        ema12 > ema144
+        and ema144 > ema169
+        and ema169 > ema576
+        and ema576 > ema676
+        and close > ema144
     )
 
     bearish = (
-        e12 < e144
-        and e144 < e169
-        and e169 < e576
-        and e576 < e676
-        and close < e144
+        ema12 < ema144
+        and ema144 < ema169
+        and ema169 < ema576
+        and ema576 < ema676
+        and close < ema144
     )
 
     if bullish:
-
         return "LONG"
 
     if bearish:
-
         return "SHORT"
 
     return "NEUTRAL"
 
 
 # ============================================================
-# 价格格式
+# Vegas信号
+# ============================================================
+
+def vegas_signal(symbol):
+
+    h1 = bybit_kline(
+        symbol,
+        "60",
+        750
+    )
+
+    if not h1:
+        return None
+
+    direction = get_1h_direction(h1)
+
+    if direction == "NEUTRAL":
+        return None
+
+    m15 = bybit_kline(
+        symbol,
+        "15",
+        300
+    )
+
+    if not m15 or len(m15) < 200:
+        return None
+
+    closes = [
+        x["close"]
+        for x in m15
+    ]
+
+    ema12 = calculate_ema_series(
+        closes,
+        12
+    )
+
+    ema144 = calculate_ema_series(
+        closes,
+        144
+    )
+
+    ema169 = calculate_ema_series(
+        closes,
+        169
+    )
+
+    # --------------------------------------------------------
+    # B1
+    # 深破后 EMA12 穿越 EMA144
+    # 优先级最高
+    # --------------------------------------------------------
+
+    if len(m15) >= 5:
+
+        prev = -2
+        curr = -1
+
+        if direction == "LONG":
+
+            price_below = (
+                m15[prev]["close"] < ema144[prev]
+                and
+                m15[prev]["close"] < ema169[prev]
+            )
+
+            ema12_below = (
+                ema12[prev] < ema144[prev]
+                and
+                ema12[prev] < ema169[prev]
+            )
+
+            cross_up = (
+                ema12[prev] <= ema144[prev]
+                and
+                ema12[curr] > ema144[curr]
+            )
+
+            if price_below and ema12_below and cross_up:
+
+                return create_signal(
+                    symbol,
+                    "LONG",
+                    m15,
+                    curr
+                )
+
+        else:
+
+            price_above = (
+                m15[prev]["close"] > ema144[prev]
+                and
+                m15[prev]["close"] > ema169[prev]
+            )
+
+            ema12_above = (
+                ema12[prev] > ema144[prev]
+                and
+                ema12[prev] > ema169[prev]
+            )
+
+            cross_down = (
+                ema12[prev] >= ema144[prev]
+                and
+                ema12[curr] < ema144[curr]
+            )
+
+            if price_above and ema12_above and cross_down:
+
+                return create_signal(
+                    symbol,
+                    "SHORT",
+                    m15,
+                    curr
+                )
+
+    # --------------------------------------------------------
+    # B2
+    # 浅破后重新站回
+    # --------------------------------------------------------
+
+    i = len(m15) - 2
+
+    if i >= 2:
+
+        prev = i - 1
+
+        if direction == "LONG":
+
+            broke = (
+                m15[prev]["close"] < ema144[prev]
+                and
+                m15[prev]["close"] < ema169[prev]
+            )
+
+            ema12_stayed = (
+                ema12[prev] >= ema144[prev]
+                or
+                ema12[prev] >= ema169[prev]
+            )
+
+            reclaim = (
+                m15[i]["low"] > ema144[i]
+                and
+                m15[i]["close"] > ema169[i]
+            )
+
+            if broke and ema12_stayed and reclaim:
+
+                return create_signal(
+                    symbol,
+                    "LONG",
+                    m15,
+                    i
+                )
+
+        else:
+
+            broke = (
+                m15[prev]["close"] > ema144[prev]
+                and
+                m15[prev]["close"] > ema169[prev]
+            )
+
+            ema12_stayed = (
+                ema12[prev] <= ema144[prev]
+                or
+                ema12[prev] <= ema169[prev]
+            )
+
+            reclaim = (
+                m15[i]["high"] < ema144[i]
+                and
+                m15[i]["close"] < ema169[i]
+            )
+
+            if broke and ema12_stayed and reclaim:
+
+                return create_signal(
+                    symbol,
+                    "SHORT",
+                    m15,
+                    i
+                )
+
+    # --------------------------------------------------------
+    # A
+    # 正常回踩144
+    # --------------------------------------------------------
+
+    i = len(m15) - 2
+
+    price = m15[i]["close"]
+
+    if direction == "LONG":
+
+        near_144 = (
+            abs(price - ema144[i])
+            / ema144[i]
+            <= 0.02
+        )
+
+        not_break_169 = (
+            m15[i]["close"]
+            >= ema169[i] * 0.995
+        )
+
+        reclaim_12 = (
+            m15[i]["close"]
+            > ema12[i]
+        )
+
+        if near_144 and not_break_169 and reclaim_12:
+
+            return create_signal(
+                symbol,
+                "LONG",
+                m15,
+                i
+            )
+
+    else:
+
+        near_144 = (
+            abs(price - ema144[i])
+            / ema144[i]
+            <= 0.02
+        )
+
+        not_break_169 = (
+            m15[i]["close"]
+            <= ema169[i] * 1.005
+        )
+
+        reclaim_12 = (
+            m15[i]["close"]
+            < ema12[i]
+        )
+
+        if near_144 and not_break_169 and reclaim_12:
+
+            return create_signal(
+                symbol,
+                "SHORT",
+                m15,
+                i
+            )
+
+    return None
+
+
+# ============================================================
+# 止损止盈
+# ============================================================
+
+def create_signal(symbol, direction, candles, signal_index):
+
+    # 信号K线不参与止损计算
+    start = max(
+        0,
+        signal_index - 10
+    )
+
+    previous = candles[start:signal_index]
+
+    if len(previous) < 10:
+        return None
+
+    if direction == "LONG":
+
+        entry = candles[signal_index]["close"]
+
+        lowest = min(
+            x["low"]
+            for x in previous
+        )
+
+        stop = lowest * 0.995
+
+        if stop >= entry:
+            return None
+
+        take_profit = (
+            entry
+            + 2 * (entry - stop)
+        )
+
+    else:
+
+        entry = candles[signal_index]["close"]
+
+        highest = max(
+            x["high"]
+            for x in previous
+        )
+
+        stop = highest * 1.005
+
+        if stop <= entry:
+            return None
+
+        take_profit = (
+            entry
+            - 2 * (stop - entry)
+        )
+
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "entry": entry,
+        "stop": stop,
+        "take_profit": take_profit,
+        "time": candles[signal_index]["time"]
+    }
+
+
+# ============================================================
+# 信号发送
 # ============================================================
 
 def format_price(price):
 
-    if price is None:
-
-        return "N/A"
-
     if price >= 1000:
-
         return f"{price:.2f}"
 
     if price >= 1:
-
         return f"{price:.4f}"
 
-    if price >= 0.01:
-
-        return f"{price:.6f}"
-
-    return f"{price:.8f}"
+    return f"{price:.8f}".rstrip("0").rstrip(".")
 
 
-# ============================================================
-# Vegas A
-# ============================================================
+def signal_text(signal):
 
-def strategy_a(
-    data15,
-    direction
-):
-
-    if direction not in [
-        "LONG",
-        "SHORT"
-    ]:
-
-        return None
-
-    if len(data15) < 20:
-
-        return None
-
-    # 最后一根已经完成的15M K线
-    candle = data15[-2]
-
-    e12 = candle["ema12"]
-    e144 = candle["ema144"]
-    e169 = candle["ema169"]
-
-    if None in [
-        e12,
-        e144,
-        e169
-    ]:
-
-        return None
-
-    close = candle["close"]
-
-    zone_upper = e144 * 1.02
-    zone_lower = e144 * 0.98
-
-    entered_zone = (
-        candle["low"] <= zone_upper
-        and candle["high"] >= zone_lower
-    )
-
-    if not entered_zone:
-
-        return None
-
-    # LONG
-    if direction == "LONG":
-
-        # 不允许有效跌破169
-        if close < e169:
-
-            return None
-
-        # 收盘重新站上12
-        if close > e12:
-
-            return {
-                "side": "LONG",
-                "index": len(data15) - 2,
-                "strategy": "A"
-            }
-
-    # SHORT
-    if direction == "SHORT":
-
-        # 不允许有效突破169
-        if close > e169:
-
-            return None
-
-        # 收盘重新跌破12
-        if close < e12:
-
-            return {
-                "side": "SHORT",
-                "index": len(data15) - 2,
-                "strategy": "A"
-            }
-
-    return None
-
-
-# ============================================================
-# Vegas B2
-# ============================================================
-
-def strategy_b2(
-    data15,
-    direction
-):
-
-    if direction not in [
-        "LONG",
-        "SHORT"
-    ]:
-
-        return None
-
-    if len(data15) < 20:
-
-        return None
-
-    previous = data15[-3]
-
-    current = data15[-2]
-
-    p12 = previous["ema12"]
-    p144 = previous["ema144"]
-    p169 = previous["ema169"]
-
-    c12 = current["ema12"]
-    c144 = current["ema144"]
-    c169 = current["ema169"]
-
-    if None in [
-        p12,
-        p144,
-        p169,
-        c12,
-        c144,
-        c169
-    ]:
-
-        return None
-
-    # ========================================================
-    # LONG B2
-    # ========================================================
+    direction = signal["direction"]
 
     if direction == "LONG":
-
-        price_break = (
-            previous["close"] < p144
-            or previous["close"] < p169
-        )
-
-        ema12_holds = (
-            p12 >= p144
-            and p12 >= p169
-        )
-
-        reclaim = (
-            current["low"] > c144
-            and current["close"] > c169
-        )
-
-        if (
-            price_break
-            and ema12_holds
-            and reclaim
-        ):
-
-            return {
-                "side": "LONG",
-                "index": len(data15) - 2,
-                "strategy": "B2"
-            }
-
-    # ========================================================
-    # SHORT B2
-    # ========================================================
-
-    if direction == "SHORT":
-
-        price_break = (
-            previous["close"] > p144
-            or previous["close"] > p169
-        )
-
-        ema12_holds = (
-            p12 <= p144
-            and p12 <= p169
-        )
-
-        reclaim = (
-            current["high"] < c144
-            and current["close"] < c169
-        )
-
-        if (
-            price_break
-            and ema12_holds
-            and reclaim
-        ):
-
-            return {
-                "side": "SHORT",
-                "index": len(data15) - 2,
-                "strategy": "B2"
-            }
-
-    return None
-
-
-# ============================================================
-# Vegas B1
-# ============================================================
-
-def strategy_b1(
-    data15,
-    direction
-):
-
-    if direction not in [
-        "LONG",
-        "SHORT"
-    ]:
-
-        return None
-
-    if len(data15) < 20:
-
-        return None
-
-    # 已完成K线
-    previous = data15[-2]
-
-    # 当前正在形成中的15M K线
-    current = data15[-1]
-
-    p12 = previous["ema12"]
-    p144 = previous["ema144"]
-    p169 = previous["ema169"]
-
-    c12 = current["ema12"]
-    c144 = current["ema144"]
-    c169 = current["ema169"]
-
-    if None in [
-        p12,
-        p144,
-        p169,
-        c12,
-        c144,
-        c169
-    ]:
-
-        return None
-
-    # ========================================================
-    # LONG B1
-    # ========================================================
-
-    if direction == "LONG":
-
-        deep_break = (
-            previous["close"] < p144
-            and previous["close"] < p169
-            and p12 < p144
-            and p12 < p169
-        )
-
-        ema12_cross_up = (
-            p12 <= p144
-            and c12 > c144
-        )
-
-        if (
-            deep_break
-            and ema12_cross_up
-        ):
-
-            return {
-                "side": "LONG",
-                "index": len(data15) - 1,
-                "strategy": "B1"
-            }
-
-    # ========================================================
-    # SHORT B1
-    # ========================================================
-
-    if direction == "SHORT":
-
-        deep_break = (
-            previous["close"] > p144
-            and previous["close"] > p169
-            and p12 > p144
-            and p12 > p169
-        )
-
-        ema12_cross_down = (
-            p12 >= p144
-            and c12 < c144
-        )
-
-        if (
-            deep_break
-            and ema12_cross_down
-        ):
-
-            return {
-                "side": "SHORT",
-                "index": len(data15) - 1,
-                "strategy": "B1"
-            }
-
-    return None
-
-
-# ============================================================
-# 止损 / 止盈
-# ============================================================
-
-def calculate_sl_tp(
-    data15,
-    signal_index,
-    side,
-    entry
-):
-
-    start = signal_index - 10
-
-    end = signal_index
-
-    if start < 0:
-
-        return None, None
-
-    previous_candles = data15[
-        start:end
-    ]
-
-    if len(previous_candles) < 10:
-
-        return None, None
-
-    # ========================================================
-    # LONG
-    # ========================================================
-
-    if side == "LONG":
-
-        lowest = min(
-            candle["low"]
-            for candle in previous_candles
-        )
-
-        sl = lowest * 0.995
-
-        risk = entry - sl
-
-        if risk <= 0:
-
-            return None, None
-
-        tp = entry + (
-            risk * 2
-        )
-
-    # ========================================================
-    # SHORT
-    # ========================================================
-
-    else:
-
-        highest = max(
-            candle["high"]
-            for candle in previous_candles
-        )
-
-        sl = highest * 1.005
-
-        risk = sl - entry
-
-        if risk <= 0:
-
-            return None, None
-
-        tp = entry - (
-            risk * 2
-        )
-
-    return sl, tp
-
-
-# ============================================================
-# 信号冷却
-# ============================================================
-
-def cooldown_ok(symbol):
-
-    last_time = last_signal_time.get(
-        symbol
-    )
-
-    if last_time is None:
-
-        return True
-
-    return (
-        time.time() - last_time
-        >= COOLDOWN_SECONDS
-    )
-
-
-# ============================================================
-# 生成交易信号
-# ============================================================
-
-def make_signal(symbol):
-
-    try:
-
-        # ====================================================
-        # 1H
-        # ====================================================
-
-        data1h = get_klines(
-            symbol,
-            "60",
-            700
-        )
-
-        if len(data1h) < 700:
-
-            return None
-
-        data1h = add_indicators(
-            data1h
-        )
-
-        direction = get_1h_direction(
-            data1h
-        )
-
-        if direction == "NEUTRAL":
-
-            return None
-
-        # ====================================================
-        # 15M
-        # ====================================================
-
-        data15 = get_klines(
-            symbol,
-            "15",
-            700
-        )
-
-        if len(data15) < 700:
-
-            return None
-
-        data15 = add_indicators(
-            data15
-        )
-
-        # ====================================================
-        # B1优先
-        # ====================================================
-
-        signal = strategy_b1(
-            data15,
-            direction
-        )
-
-        # ====================================================
-        # B2
-        # ====================================================
-
-        if signal is None:
-
-            signal = strategy_b2(
-                data15,
-                direction
-            )
-
-        # ====================================================
-        # A
-        # ====================================================
-
-        if signal is None:
-
-            signal = strategy_a(
-                data15,
-                direction
-            )
-
-        if signal is None:
-
-            return None
-
-        side = signal["side"]
-
-        index = signal["index"]
-
-        # 当前K线价格
-        entry = data15[index]["close"]
-
-        sl, tp = calculate_sl_tp(
-            data15,
-            index,
-            side,
-            entry
-        )
-
-        if sl is None or tp is None:
-
-            return None
-
-        return {
-
-            "symbol": symbol,
-
-            "side": side,
-
-            "entry": entry,
-
-            "sl": sl,
-
-            "tp": tp,
-
-            "strategy": signal["strategy"]
-
-        }
-
-    except Exception as e:
-
-        print(
-            f"{symbol}信号计算异常:",
-            e
-        )
-
-        return None
-
-
-# ============================================================
-# Telegram信号格式
-# ============================================================
-
-def build_signal_message(
-    signal
-):
-
-    symbol = signal["symbol"]
-
-    side = signal["side"]
-
-    entry = signal["entry"]
-
-    sl = signal["sl"]
-
-    tp = signal["tp"]
-
-    signal_time = (
-        datetime.now()
-        .strftime("%Y-%m-%d %H:%M")
-    )
-
-    if side == "LONG":
 
         return (
             "🟢 多单信号\n\n"
-            f"币种：{symbol}\n"
-            f"📍 入场价：{format_price(entry)}\n"
-            f"🛑 止损：{format_price(sl)}\n"
-            f"🎯 止盈：{format_price(tp)}\n\n"
-            f"⏱ 信号时间：{signal_time}"
+            f"币种：{signal['symbol']}\n"
+            f"📍 入场价：{format_price(signal['entry'])}\n"
+            f"🛑 止损：{format_price(signal['stop'])}\n"
+            f"🎯 止盈：{format_price(signal['take_profit'])}\n\n"
+            f"⏱ 信号时间：{time.strftime('%Y-%m-%d %H:%M')}"
         )
 
     return (
         "🔴 空单信号\n\n"
-        f"币种：{symbol}\n"
-        f"📍 入场价：{format_price(entry)}\n"
-        f"🛑 止损：{format_price(sl)}\n"
-        f"🎯 止盈：{format_price(tp)}\n\n"
-        f"⏱ 信号时间：{signal_time}"
+        f"币种：{signal['symbol']}\n"
+        f"📍 入场价：{format_price(signal['entry'])}\n"
+        f"🛑 止损：{format_price(signal['stop'])}\n"
+        f"🎯 止盈：{format_price(signal['take_profit'])}\n\n"
+        f"⏱ 信号时间：{time.strftime('%Y-%m-%d %H:%M')}"
     )
 
 
-# ============================================================
-# /debug
-# ============================================================
+def process_symbol(symbol):
 
-def debug_symbol(symbol):
+    try:
 
-    symbol = symbol.upper().strip()
+        signal = vegas_signal(symbol)
 
-    if not symbol.endswith("USDT"):
+        if not signal:
+            return
 
-        symbol += "USDT"
+        now = time.time()
 
-    if symbol not in SYMBOLS:
+        with state_lock:
 
-        return (
-            f"❌ {symbol} 不在监控列表中"
-        )
+            last = last_signal_time.get(symbol, 0)
 
-    data = get_klines(
-        symbol,
-        "60",
-        700
-    )
-
-    if len(data) < 700:
-
-        return (
-            f"❌ {symbol}\n\n"
-            "1H K线数据不足\n"
-            f"收到：{len(data)}根"
-        )
-
-    data = add_indicators(
-        data
-    )
-
-    candle = data[-2]
-
-    close = candle["close"]
-
-    e12 = candle["ema12"]
-
-    e144 = candle["ema144"]
-
-    e169 = candle["ema169"]
-
-    e576 = candle["ema576"]
-
-    e676 = candle["ema676"]
-
-    direction = get_1h_direction(
-        data
-    )
-
-    # ========================================================
-    # EMA排列
-    # ========================================================
-
-    if None in [
-        e12,
-        e144,
-        e169,
-        e576,
-        e676
-    ]:
-
-        alignment = "❌ EMA数据不足"
-
-    elif (
-        e12
-        > e144
-        > e169
-        > e576
-        > e676
-    ):
-
-        alignment = "🟢 完整多头排列"
-
-    elif (
-        e12
-        < e144
-        < e169
-        < e576
-        < e676
-    ):
-
-        alignment = "🔴 完整空头排列"
-
-    else:
-
-        alignment = "⚪ 非完整排列"
-
-    if close > e144:
-
-        price_position = (
-            "🟢 收盘价在EMA144上方"
-        )
-
-    else:
-
-        price_position = (
-            "🔴 收盘价在EMA144下方"
-        )
-
-    candle_time = datetime.fromtimestamp(
-        candle["time"] / 1000
-    ).strftime(
-        "%Y-%m-%d %H:%M"
-    )
-
-    return (
-        f"🔍 {symbol} 1H诊断\n\n"
-
-        f"K线时间：{candle_time}\n"
-        f"收盘价：{format_price(close)}\n\n"
-
-        f"EMA12：{format_price(e12)}\n"
-        f"EMA144：{format_price(e144)}\n"
-        f"EMA169：{format_price(e169)}\n"
-        f"EMA576：{format_price(e576)}\n"
-        f"EMA676：{format_price(e676)}\n\n"
-
-        f"EMA排列：{alignment}\n"
-        f"{price_position}\n\n"
-
-        f"最终1H方向：{direction}"
-    )
-
-
-# ============================================================
-# /status
-# ============================================================
-
-def get_status():
-
-    long_count = 0
-
-    short_count = 0
-
-    neutral_count = 0
-
-    for symbol in SYMBOLS:
-
-        try:
-
-            data = get_klines(
-                symbol,
-                "60",
-                700
-            )
-
-            if len(data) < 700:
-
-                neutral_count += 1
-
-                continue
-
-            data = add_indicators(
-                data
-            )
-
-            direction = get_1h_direction(
-                data
-            )
-
-            if direction == "LONG":
-
-                long_count += 1
-
-            elif direction == "SHORT":
-
-                short_count += 1
-
-            else:
-
-                neutral_count += 1
-
-        except Exception:
-
-            neutral_count += 1
-
-    return (
-        "🤖 机器人状态：运行中\n\n"
-
-        f"监控币种：{len(SYMBOLS)}\n"
-
-        f"1H多头：{long_count}\n"
-
-        f"1H空头：{short_count}\n"
-
-        f"1H无方向：{neutral_count}\n"
-
-        "Bybit：正常\n\n"
-
-        "策略：Vegas A / B1 / B2\n"
-
-        "信号冷却：每币种4小时"
-    )
-
-
-# ============================================================
-# Telegram命令
-# ============================================================
-
-def handle_command(text):
-
-    text = text.strip()
-
-    # --------------------------------------------------------
-    # /start
-    # --------------------------------------------------------
-
-    if text.startswith("/start"):
-
-        return (
-            "🤖 Vegas交易信号机器人\n\n"
-
-            "机器人已经启动。\n\n"
-
-            "可用命令：\n"
-
-            "/status - 查看机器人状态\n"
-
-            "/debug BTCUSDT - 查看1H EMA诊断"
-        )
-
-    # --------------------------------------------------------
-    # /status
-    # --------------------------------------------------------
-
-    if text.startswith("/status"):
-
-        return get_status()
-
-    # --------------------------------------------------------
-    # /debug
-    # --------------------------------------------------------
-
-    if text.startswith("/debug"):
-
-        parts = text.split()
-
-        if len(parts) < 2:
-
-            return (
-                "用法：\n"
-                "/debug BTCUSDT"
-            )
-
-        return debug_symbol(
-            parts[1]
-        )
-
-    return None
-
-
-# ============================================================
-# Telegram监听
-# ============================================================
-
-async def telegram_loop():
-
-    print(
-        "Telegram监听启动"
-    )
-
-    while True:
-
-        try:
-
-            updates = await asyncio.to_thread(
-                get_updates
-            )
-
-            for update in updates:
-
-                message = update.get(
-                    "message"
-                )
-
-                if not message:
-
-                    continue
-
-                text = message.get(
-                    "text",
-                    ""
-                )
-
-                if not text:
-
-                    continue
-
-                chat_id = str(
-                    message
-                    .get("chat", {})
-                    .get("id", "")
-                )
-
-                # 只响应指定群
-                if chat_id != str(CHAT_ID):
-
-                    continue
+            if now - last < SIGNAL_COOLDOWN:
 
                 print(
-                    "收到Telegram消息:",
-                    text
+                    f"[COOLDOWN] {symbol}",
+                    flush=True
                 )
 
-                response = await asyncio.to_thread(
-                    handle_command,
-                    text
+                return
+
+            last_signal_time[symbol] = now
+
+        text = signal_text(signal)
+
+        print(
+            f"[SIGNAL] {symbol} {signal['direction']}",
+            flush=True
+        )
+
+        success = send_message(text)
+
+        if not success:
+
+            # 如果Telegram发送失败，不应该把币种永久锁住
+            with state_lock:
+                last_signal_time.pop(
+                    symbol,
+                    None
                 )
 
-                if response:
+    except Exception as e:
 
-                    await asyncio.to_thread(
-                        send_message,
-                        response
-                    )
-
-        except Exception as e:
-
-            print(
-                "Telegram监听异常:",
-                e
-            )
-
-        await asyncio.sleep(1)
+        print(
+            f"[SCANNER ERROR] {symbol}: {repr(e)}",
+            flush=True
+        )
 
 
 # ============================================================
 # 交易扫描
 # ============================================================
 
-async def trading_loop():
+def trading_scanner():
+
+    global scanner_running
+
+    scanner_running = True
 
     print(
-        f"交易扫描启动，"
-        f"监控 {len(SYMBOLS)} 个币"
+        f"[SCANNER] Started. Monitoring {len(SYMBOLS)} symbols.",
+        flush=True
     )
+
+    # 先等待Telegram启动
+    time.sleep(5)
 
     while True:
 
-        for symbol in SYMBOLS:
-
-            try:
-
-                # 4小时冷却
-                if not cooldown_ok(symbol):
-
-                    continue
-
-                signal = await asyncio.to_thread(
-                    make_signal,
-                    symbol
-                )
-
-                if signal:
-
-                    message = (
-                        build_signal_message(
-                            signal
-                        )
-                    )
-
-                    success = (
-                        await asyncio.to_thread(
-                            send_message,
-                            message
-                        )
-                    )
-
-                    if success:
-
-                        last_signal_time[
-                            symbol
-                        ] = time.time()
-
-                        print(
-                            "发送信号:",
-                            symbol,
-                            signal["side"],
-                            signal["strategy"]
-                        )
-
-            except Exception as e:
-
-                print(
-                    f"{symbol}扫描异常:",
-                    e
-                )
-
-            # 防止请求过快
-            await asyncio.sleep(
-                0.2
-            )
+        scan_start = time.time()
 
         print(
-            "本轮扫描完成，"
-            "等待下一轮..."
+            "[SCANNER] New scan started...",
+            flush=True
         )
 
-        await asyncio.sleep(
-            60
+        with ThreadPoolExecutor(
+            max_workers=8
+        ) as executor:
+
+            futures = [
+                executor.submit(
+                    process_symbol,
+                    symbol
+                )
+                for symbol in SYMBOLS
+            ]
+
+            for future in as_completed(futures):
+
+                try:
+                    future.result()
+
+                except Exception as e:
+
+                    print(
+                        f"[SCANNER FUTURE ERROR] {repr(e)}",
+                        flush=True
+                    )
+
+        elapsed = time.time() - scan_start
+
+        print(
+            f"[SCANNER] Scan finished in {elapsed:.1f}s",
+            flush=True
         )
+
+        time.sleep(
+            max(
+                5,
+                SCAN_INTERVAL - elapsed
+            )
+        )
+
+
+# ============================================================
+# DEBUG
+# ============================================================
+
+def debug_symbol(symbol, chat_id):
+
+    print(
+        f"[DEBUG] Checking {symbol}",
+        flush=True
+    )
+
+    h1 = bybit_kline(
+        symbol,
+        "60",
+        750
+    )
+
+    m15 = bybit_kline(
+        symbol,
+        "15",
+        300
+    )
+
+    if not h1:
+
+        send_message(
+            f"❌ {symbol}\n\n1H 数据获取失败。",
+            chat_id
+        )
+
+        return
+
+    if not m15:
+
+        send_message(
+            f"❌ {symbol}\n\n15M 数据获取失败。",
+            chat_id
+        )
+
+        return
+
+    direction = get_1h_direction(h1)
+
+    signal = vegas_signal(symbol)
+
+    if signal:
+
+        result = (
+            f"🔎 {symbol} DEBUG\n\n"
+            f"1H方向：{direction}\n"
+            f"当前检测：有信号\n"
+            f"方向：{signal['direction']}\n"
+            f"入场：{format_price(signal['entry'])}\n"
+            f"止损：{format_price(signal['stop'])}\n"
+            f"止盈：{format_price(signal['take_profit'])}"
+        )
+
+    else:
+
+        result = (
+            f"🔎 {symbol} DEBUG\n\n"
+            f"1H方向：{direction}\n"
+            "15M：当前没有符合条件的信号\n\n"
+            "这不是程序错误，只代表当前没有满足策略条件。"
+        )
+
+    send_message(
+        result,
+        chat_id
+    )
 
 
 # ============================================================
 # 主程序
 # ============================================================
 
-async def main_async():
-
-    print("=" * 60)
+def main():
 
     print(
-        "Vegas Telegram Trading Bot"
+        "==================================================",
+        flush=True
     )
 
-    print("=" * 60)
+    print(
+        "Vegas Trading Bot starting...",
+        flush=True
+    )
+
+    print(
+        f"Python process PID: {os.getpid()}",
+        flush=True
+    )
+
+    print(
+        f"Symbols: {len(SYMBOLS)}",
+        flush=True
+    )
+
+    print(
+        f"Chat ID: {CHAT_ID}",
+        flush=True
+    )
 
     if not BOT_TOKEN:
 
         print(
-            "❌ BOT_TOKEN 未设置"
+            "[FATAL] BOT_TOKEN environment variable is EMPTY!",
+            flush=True
         )
 
+        # HTTP服务仍然启动，方便Render显示服务
+        start_web_server()
         return
 
-    print(
-        f"监控币种数量：{len(SYMBOLS)}"
-    )
-
-    print(
-        f"Telegram Chat ID：{CHAT_ID}"
-    )
-
-    print(
-        "Bybit API：正常模式"
-    )
-
-    print(
-        "Vegas EMA：12 / 144 / 169 / 576 / 676"
-    )
-
-    print(
-        "策略：A / B1 / B2"
-    )
-
-    print(
-        "信号冷却：4小时"
-    )
-
-    await asyncio.gather(
-        telegram_loop(),
-        trading_loop()
-    )
-
-
-def main():
-
-    # ========================================================
-    # Render Free Web Service需要监听PORT
-    # ========================================================
+    # --------------------------------------------------------
+    # Web服务
+    # --------------------------------------------------------
 
     web_thread = threading.Thread(
         target=start_web_server,
@@ -1564,27 +1138,66 @@ def main():
 
     web_thread.start()
 
-    # ========================================================
-    # 启动Telegram + 交易扫描
-    # ========================================================
+    time.sleep(1)
 
-    try:
+    # --------------------------------------------------------
+    # Telegram
+    # --------------------------------------------------------
 
-        asyncio.run(
-            main_async()
-        )
+    telegram_thread = threading.Thread(
+        target=telegram_polling,
+        daemon=True
+    )
 
-    except KeyboardInterrupt:
+    telegram_thread.start()
+
+    # --------------------------------------------------------
+    # 交易扫描
+    # --------------------------------------------------------
+
+    scanner_thread = threading.Thread(
+        target=trading_scanner,
+        daemon=True
+    )
+
+    scanner_thread.start()
+
+    print(
+        "==================================================",
+        flush=True
+    )
+
+    print(
+        "[MAIN] All services started.",
+        flush=True
+    )
+
+    print(
+        "[MAIN] Telegram polling thread started.",
+        flush=True
+    )
+
+    print(
+        "[MAIN] Trading scanner thread started.",
+        flush=True
+    )
+
+    print(
+        "==================================================",
+        flush=True
+    )
+
+    # 主线程永远运行
+    while True:
+
+        time.sleep(60)
 
         print(
-            "机器人已停止"
+            f"[HEARTBEAT] Telegram={telegram_running} "
+            f"Scanner={scanner_running}",
+            flush=True
         )
 
 
-# ============================================================
-# 程序入口
-# ============================================================
-
 if __name__ == "__main__":
-
     main()
